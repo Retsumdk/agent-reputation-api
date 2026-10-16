@@ -1,84 +1,68 @@
 # agent-reputation-api
 
-Time-decayed, sybil-damped reputation scores for autonomous agents: signed peer attestations, a zero-dependency HTTP API, atomic persistence, and a CLI.
+[![CI](https://github.com/Retsumdk/agent-reputation-api/actions/workflows/ci.yml/badge.svg)](https://github.com/Retsumdk/agent-reputation-api/actions/workflows/ci.yml)
+
+Time-decayed, sybil-damped reputation scores for autonomous agents. Agents attest about each other on four dimensions; the ledger verifies every attestation's HMAC signature, dampes attestor influence by the attestor's own reputation, decays stale evidence with a 30-day half-life, and reports a score with an honest statistical lower bound — so "4.9 stars from two friends" never reads as trust.
+
+Zero runtime dependencies. TypeScript strict mode. Node ≥ 18.17, Bun, or any runtime with `node:crypto` and WHATWG `fetch`.
 
 ## The problem
 
-Multi-agent systems need to decide *whom to trust*: which scout's research to act on, which executor's code to deploy, which summarizer's output to forward. Self-reported claims are worthless — every agent says it is reliable. Peer attestations help, but naive averaging breaks in three ways:
-
-1. **Stale evidence.** An agent that was excellent six months ago may not be today. A raw lifetime average never forgets.
-2. **Sybil rings.** A group of colluding agents can attest about each other to manufacture trust. Unweighted peer votes make this free.
-3. **Small-sample overconfidence.** Two perfect attestations do not make an agent trustworthy — but a plain mean looks identical whether it rests on 2 samples or 200.
-
-`agent-reputation-api` solves all three with one scoring model, ships as a single zero-dependency TypeScript package, and exposes the result over a small HTTP API and a CLI.
+Multi-agent systems delegate work to each other, but they have no memory of who actually delivered. Every agent starts each negotiation trusting-or-not based on a prompt, and a single loud failure (or a coordinated ring of flatterers) resets the board. What's missing is a small, verifiable ledger that answers one question: *given everything peers have signed about this agent, how much should you trust it right now — and how confident are we, really?*
 
 ## How it works
 
-### Attestations
-
-An **attestation** is a signed peer review: one registered agent (`attestorId`) scores another (`subjectId`) on one of four dimensions — `reliability`, `correctness`, `responsiveness`, `candor` — with a 0–100 score, an epoch-millisecond timestamp, and a single-use nonce. The signature is HMAC-SHA256 over a canonical string:
-
 ```
-v1|<attestorId>|<subjectId>|<dimension>|<score>|<ts>|<nonce>
+attestor ── signs ──▶ Attestation ──▶ ReputationLedger ──▶ ScoreReport
+            (HMAC)      (nonce, ts)        (guards)          (per dimension)
 ```
 
-The field order is fixed, so the signature domain is exactly those seven values. Verification is constant-time; tampering with any covered field (or replaying a used nonce) is rejected.
+**Attestations.** A peer attests `{attestorId, subjectId, dimension, score 0–100, ts, nonce}`. The canonical string `v1|attestor|subject|dimension|score|ts|nonce` is signed with HMAC-SHA256 under a network secret; verification is constant-time. Four dimensions: `reliability`, `correctness`, `responsiveness`, `candor`.
 
-The ledger enforces, in order: structural validation → self-attestation rejection (`FORBIDDEN`) → signature verification (`UNAUTHORIZED`) → nonce replay check (`REPLAY`) → a per-pair rate cap, default 5 attestations per attestor–subject pair per 24h window (`RATE_LIMITED`). Timestamps must fall within a ±10-minute skew window of ledger time.
+**Ledger guards** (each a distinct rejection, not a silent drop):
 
-### Scoring
+| Guard | Error | Why |
+|---|---|---|
+| Self-attestation | `FORBIDDEN` (403) | You cannot vote for yourself. |
+| Bad signature | `UNAUTHORIZED` (401) | Only secret-holders write. |
+| Reused nonce | `REPLAY` (409) | A signed attestation cannot be re-submitted. |
+| Timestamp outside ±10 min | `VALIDATION` (400) | Bounds the replay window. |
+| > 5 attestations per attestor–subject pair per 24 h | `RATE_LIMITED` (429) | Flood resistance. |
+| Unregistered attestor/subject, bad dimension, score ∉ [0, 100] | `VALIDATION` (400) | Schema integrity. |
 
-Each attestation's influence is a product of three factors:
+**Scoring** (per dimension, then aggregated):
 
-```
-w = decay(att.ts) × attestorWeight(attestor's own composite)
-```
+1. **Decay** — each attestation's weight halves every 30 days and dies at 180 days.
+2. **Sybil damping** — weight is multiplied by `0.25 + 0.75 × (attestor's own composite / 100)`. Unproven attestors count at 0.25; a ring of ten 0-weight voices cannot outvote one trusted dissenter.
+3. **Mean** — decay-weighted average of attestation scores.
+4. **Confidence** — Kish effective sample size `n_eff = (Σw)² / Σw²`, then the Wilson 95% lower bound on that mean. The lower bound is what the tier ladder consumes, so small, noisy evidence can never masquerade as trust.
+5. **Tier ladder** — calibrated to the bound's behavior at small n: `UNPROVEN` (no data) → `PROVISIONAL` (fewer than ~2 effective voices, or lower bound < 25) → `ESTABLISHED` (lower bound ≥ 25) → `TRUSTED` (n_eff ≥ 8 and lower bound ≥ 55). Dissent holds an agent down: two 90s and one 50 leave a lower bound no better than two voices agreeing.
 
-- **decay** — exponential half-life: weight halves every 30 days; attestations older than 180 days stop contributing entirely.
-- **attestorWeight** — sybil damping: an attestor's weight is `0.25 + 0.75 × (attestor's own composite / 100)`. Unproven attestors count at 0.25; a fully trusted attestor counts at 1.0. A ring of fresh accounts shouting 100s cannot outrank one established peer's dissent.
+The `composite` is the unweighted mean of dimension means; the report's `lowerBound`/`effectiveSamples` are the *minimum* across dimensions — the weakest dimension decides, which is the conservative reading an operator wants.
 
-Per dimension, the score is the weighted mean, and confidence comes from the **Kish effective sample size** — `(Σw)² / Σw²` — which discounts heavily when one attestation dominates the weight. The reported `lowerBound` is the Wilson 95% lower bound on that mean, which stays honest at small sample sizes: two perfect attestations yield a lower bound around 28, not 100.
-
-The **composite** is the unweighted mean of dimension means; the report's `lowerBound`/`effectiveSamples` are the most conservative (minimum) across dimensions.
-
-Tiers are calibrated against the Wilson bound's behavior at small n:
-
-| Tier | Condition (per report: min across dimensions) |
-|---|---|
-| `unproven` | no live attestations |
-| `provisional` | effective samples < 1.5, or lower bound < 25 |
-| `established` | lower bound ≥ 25 |
-| `trusted` | effective samples ≥ 8 **and** lower bound ≥ 55 |
-
-In practice: two or three consistent high attestations reach ESTABLISHED; roughly eight consistent high attestations reach TRUSTED; dissent or low scores hold an agent at PROVISIONAL.
-
-Attestor weights are sourced in two passes: every agent is first scored as if all attestors were unproven (weight 0.25), then each attestation is re-weighted by its attestor's first-pass composite. This damps self-reinforcing rings without requiring an iterative solver.
+**Persistence.** `saveEnvelope` writes a temp file then `rename`s over the target (atomic); nonces are rebuilt from the attestation log on load, so replay protection survives restarts. Per-pair rate-limit state is not persisted and resets on restart — documented, deliberate trade-off.
 
 ## Getting started
-
-Requires Node ≥ 18.17 (or Bun ≥ 1.0) for development. The package has **zero runtime dependencies**.
 
 ```bash
 git clone https://github.com/Retsumdk/agent-reputation-api.git
 cd agent-reputation-api
-npm install        # runs `prepare`, which builds dist/
-npm test           # 58 tests
+bun install        # runs the TypeScript build via "prepare"
+bun test           # 58 tests
+bun run demo       # deterministic scenario — byte-identical every run
 ```
 
-Install straight from GitHub (no registry publish needed):
+Or install straight from GitHub (no registry release required — `prepare` builds `dist/` on install):
 
 ```bash
 npm install github:Retsumdk/agent-reputation-api
 ```
 
-Bun users: Bun blocks git-dependency lifecycle scripts by default, so run `bun pm trust agent-reputation-api` after `bun add github:Retsumdk/agent-reputation-api`, or just use npm for the install.
+## Examples
 
-## Quick start: the demo
-
-`rep demo` runs a deterministic 8-agent scenario — five days of attestations across a content pipeline, then the clock advances seven days so decay is visible. Output is byte-identical across runs:
+**The deterministic demo** (`bun run demo`): eight agents attest about each other over six days, the clock advances another seven days so decay is visible, and every score report is rendered:
 
 ```
-$ node dist/cli.js demo
 agent scout-1 — ESTABLISHED
 composite 91.1  lower-bound 36.5  n-eff 3.0  (computed just now)
   reliability     ██████████████████████·· 91.2  lb 47.4  n-eff 5.0
@@ -112,126 +96,90 @@ composite 83.0  lower-bound 14.3  n-eff 1.0  (computed just now)
 network: 8 agents, 32 attestations (0 in the last 24h)
 ```
 
-`scout-2` scores in the 50s and is held at PROVISIONAL despite having data; `auditor-1` scores 84 but a single attestation is not enough evidence — the lower bound says so.
+Read it like an operator: `scout-1` has six consistent voices on reliability (n-eff 5.0, lower bound 47.4) and is the agent you hand the research task to. `auditor-1` and `indexer-1` have fine averages from a single voice each — one opinion, not a reputation — so they stay PROVISIONAL. `scout-2` is damped twice over: weak scores *and* attestors whose own reputation is unproven.
 
-## Running the server
-
-```bash
-export REP_SECRET="a-long-random-network-secret"
-rep serve --port 7300 --state ledger.json
-```
-
-- Writes (register, attest, sign) require `Authorization: Bearer $REP_SECRET`; reads are public.
-- With `--state`, the ledger is atomically persisted (temp file + rename) after every mutation and on shutdown. A missing state file is a normal first boot.
-- `POST /sign` is a convenience endpoint that signs an unsigned attestation with the server secret, for clients that delegate signing to the operator.
-
-### API
-
-| Method | Path | Auth | Description |
-|---|---|---|---|
-| GET | `/health` | public | liveness + counts |
-| POST | `/agents` | bearer | register `{ id, displayName? }` |
-| POST | `/attestations` | bearer | submit a signed attestation |
-| POST | `/sign` | bearer | sign an attestation server-side |
-| GET | `/agents` | public | every agent with its current score report |
-| GET | `/agents/:id` | public | one agent + score report (404 if unknown) |
-| GET | `/network/stats` | public | counts, per-dimension totals, top 5 by composite |
-
-Errors are structured JSON: `{ "error": { "code": "REPLAY", "message": "..." } }` with codes `VALIDATION` (400), `UNAUTHORIZED` (401), `FORBIDDEN` (403), `NOT_FOUND` (404), `DUPLICATE`/`REPLAY` (409), `RATE_LIMITED` (429), `CORRUPTION`/`INTERNAL` (500).
-
-### End-to-end example
+**Run the HTTP API and attest from the CLI:**
 
 ```bash
-export REP_SECRET="a-long-random-network-secret"
-rep serve --port 7300 &
-
-curl -s -X POST localhost:7300/agents -H "authorization: Bearer $REP_SECRET" \
-  -H "content-type: application/json" -d '{"id":"alpha-1","displayName":"Alpha"}'
-# {"id":"alpha-1","createdAt":1792181488672,"attestationCount":0,...}
-
-curl -s -X POST localhost:7300/agents -H "authorization: Bearer $REP_SECRET" \
-  -H "content-type: application/json" -d '{"id":"beta-1"}'
-
-rep attest --url http://127.0.0.1:7300 --attestor alpha-1 --subject beta-1 \
-  --dimension reliability --score 91
-# attestation accepted: alpha-1 -> beta-1 (reliability 91)
-
-rep score beta-1 --url http://127.0.0.1:7300
-# agent beta-1 — PROVISIONAL
-# composite 91.0  lower-bound 17.1  n-eff 1.0  (computed just now)
-#   reliability     ██████████████████████·· 91.0  lb 17.1  n-eff 1.0
-
-curl -s -X POST localhost:7300/attestations -H "authorization: Bearer $REP_SECRET" \
-  -H "content-type: application/json" -d '{"bad":1}'
-# {"error":{"code":"UNAUTHORIZED","message":"attestation signature is required when the ledger verifies signatures"}}
+export REP_SECRET="dev-secret"
+rep serve --port 7300 --state ledger.json        # first boot starts fresh
+# another shell:
+rep attest --url http://127.0.0.1:7300 \
+  --attestor planner-1 --subject scout-1 \
+  --dimension reliability --score 92
+rep score scout-1 --url http://127.0.0.1:7300
 ```
 
-## Library use
+**As a library:**
 
 ```ts
-import { ReputationLedger, signAttestation, fixedClock, newNonce } from "agent-reputation-api";
+import { ReputationLedger, signAttestation, newNonce } from "agent-reputation-api";
 
-const clock = fixedClock(Date.UTC(2026, 6, 1));
-const ledger = new ReputationLedger({ secret: "network-secret", clock });
-
-ledger.registerAgent("planner-1", "Planner");
-ledger.registerAgent("scout-1", "Scout");
+const ledger = new ReputationLedger({ secret: "network-secret" });
+ledger.registerAgent("planner-1");
+ledger.registerAgent("scout-1");
 
 const input = {
-  attestorId: "planner-1",
-  subjectId: "scout-1",
-  dimension: "reliability" as const,
-  score: 92,
-  ts: clock.now(),
-  nonce: newNonce(),
-  sig: "",
+  attestorId: "planner-1", subjectId: "scout-1",
+  dimension: "reliability" as const, score: 92,
+  ts: Date.now(), nonce: newNonce(), sig: "",
 };
 input.sig = signAttestation(input, "network-secret");
 ledger.submitAttestation(input);
 
 const report = ledger.score("scout-1");
-console.log(report.composite, report.tier); // 92 "provisional" — one attestation is thin evidence
+console.log(report.composite, report.tier); // 92 "provisional" (one voice)
 ```
 
-The `clock` option makes every time-dependent behavior (skew windows, rate windows, decay) deterministic — tests inject `fixedClock`, production uses `systemClock`.
+Expected: the single attestation yields `composite ≈ 92` but tier `provisional` — one voice is never a reputation.
 
-## Persistence
+## HTTP API
 
-State is a versioned JSON envelope (`{ version: 1, agents, attestations }`). Nonces and rate-window timestamps are rebuilt from the attestation history on load, so replay protection survives restarts. Corrupt files raise a typed `CORRUPTION` error rather than silently starting empty.
+Writes require `Authorization: Bearer <secret>` (constant-time comparison). All errors are structured JSON: `{"error": {"code", "message"}}`.
+
+| Route | Auth | Purpose |
+|---|---|---|
+| `GET /health` | — | Liveness + counters. |
+| `POST /agents` | ✓ | `{id, displayName?}` → 201 / 409 DUPLICATE. |
+| `POST /attestations` | ✓ | Signed attestation → 201 / 401 / 403 / 409 / 429. |
+| `POST /sign` | ✓ | Convenience: signs an unsigned attestation with the server secret. |
+| `GET /agents` | — | Every agent with its current score report. |
+| `GET /agents/:id` | — | Agent record + score report → 404 if unknown. |
+| `GET /network/stats` | — | Totals, per-dimension counts, top agents by composite. |
 
 ## Project layout
 
 ```
 src/
-  types.ts        public data model (attestations, reports, envelope)
-  errors.ts       ReputationError taxonomy + HTTP status map
-  clock.ts        system/fixed clocks
-  crypto.ts       canonical string, HMAC signing/verification, nonces
-  scoring.ts      decay, attestor weighting, Wilson bounds, tiers
-  ledger.ts       validation, replay/rate guards, queries
-  persistence.ts  atomic envelope save/load
-  server.ts       zero-dependency HTTP API
-  format.ts       score-report rendering
-  demo.ts         deterministic 8-agent scenario
-  cli.ts          the `rep` CLI
-  index.ts        public entry point
-tests/            58 tests across 7 files (bun test)
+  types.ts         domain types, dimension registry
+  errors.ts        ReputationError taxonomy + HTTP status map
+  clock.ts         injectable clock (system + fixed for tests)
+  crypto.ts        canonical string, HMAC sign/verify, constant-time compare
+  scoring.ts       decay, attestor damping, Kish n-eff, Wilson bound, tiers
+  ledger.ts        the ledger: registration, guards, scoring, stats
+  persistence.ts   atomic envelope save/load
+  server.ts        zero-dependency Node http control plane
+  format.ts        deterministic score-report rendering
+  demo.ts          the deterministic 8-agent scenario
+  cli.ts           the `rep` CLI (demo / serve / attest / score)
+tests/             58 tests across 7 files (bun test)
 ```
 
-## Limits by design
+## Limits (by design)
 
-- **Single-registry trust.** One operator holds the HMAC secret; this is a reputation service for one network, not a decentralized protocol. Cross-network federation is out of scope.
-- **Two-pass damping.** Attestor weights come from one first-pass scoring round, not a fixed-point iteration. Deeply layered rings are damped, not fully dissolved.
-- **Rate windows are in-memory.** The per-pair rate cap resets on restart; replay protection does not (it is rebuilt from persisted attestations).
+- **Single registry.** Attestations are HMAC-signed under one network secret; this is a per-organization ledger, not a global blockchain. Cross-network federation is out of scope on purpose.
+- **One damping pass.** Attestor weights come from a first-pass composite computed with all attestors at the unproven baseline. Fixed-point iteration would be marginally more precise and materially harder to reason about; the damping direction is what matters.
+- **Rate-limit state is in-memory.** Restart resets pair counters; nonces do survive restarts via the envelope.
+- **Wilson bounds are approximate here.** The bound treats the weighted mean as a binomial proportion with n = n_eff — a deliberate, documented approximation, not a Bayesian estimator.
 
 ## Scripts
 
 | Script | What it does |
 |---|---|
-| `npm run build` | `tsc` → `dist/` with declarations |
-| `npm test` | full suite (bun test) |
-| `npm run typecheck` | strict typecheck including tests |
-| `npm run demo` | build + run the deterministic demo |
+| `bun run build` | `tsc -p tsconfig.json` → `dist/` |
+| `bun test` | Full test suite |
+| `bun run typecheck` | Strict typecheck of `src/` + `tests/` |
+| `bun run demo` | Build + run the deterministic demo |
 
 ## License
 

@@ -30,4 +30,4 @@ jobs:
           npm pack --pack-destination /tmp
           cd /tmp && npm init -y >/dev/null
           npm install /tmp/agent-reputation-api-1.0.0.tgz
-          node -e "const m=require('agent-reputation-api'); if(typeof m.ReputationLedger!=='function') process.exit(1); console.log('install ok')"
+          node -e "import('agent-reputation-api').then(m => { if (typeof m.ReputationLedger !== 'function') process.exit(1); console.log('install ok'); })"
