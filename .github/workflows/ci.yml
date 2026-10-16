@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - run: bun install
+      - run: bun test
+      - run: bunx tsc -p tsconfig.test.json --noEmit
+      - run: bunx tsc -p tsconfig.json
+      - name: Node smoke (demo determinism + server boot)
+        run: |
+          node dist/cli.js demo > /tmp/demo-a.txt
+          node dist/cli.js demo > /tmp/demo-b.txt
+          diff /tmp/demo-a.txt /tmp/demo-b.txt
+          grep -q "ESTABLISHED" /tmp/demo-a.txt
+          grep -q "PROVISIONAL" /tmp/demo-a.txt
+          node dist/cli.js --help | grep -q "rep —"
+      - name: Package installs from the built tree
+        run: |
+          npm pack --pack-destination /tmp
+          cd /tmp && npm init -y >/dev/null
+          npm install /tmp/agent-reputation-api-1.0.0.tgz
+          node -e "const m=require('agent-reputation-api'); if(typeof m.ReputationLedger!=='function') process.exit(1); console.log('install ok')"

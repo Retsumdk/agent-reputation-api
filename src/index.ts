@@ -1,51 +1,36 @@
-#!/usr/bin/env bun
-/**
- * agent-reputation-api - API for tracking and verifying agent reputation scores across networks
- * Built by Retsumdk
- */
-
-import { Command } from "commander";
-import { existsSync, readFileSync } from "fs";
-import { join } from "path";
-
-interface Config {
-  apiKey?: string;
-  baseUrl: string;
-  timeout: number;
-  retries: number;
-}
-
-const DEFAULTS: Config = {
-  baseUrl: "https://api.example.com",
-  timeout: 30000,
-  retries: 3,
-};
-
-function loadConfig(): Config {
-  const cfgPath = join(process.cwd(), "config.json");
-  if (existsSync(cfgPath)) {
-    try {
-      return { ...DEFAULTS, ...JSON.parse(readFileSync(cfgPath, "utf-8")) };
-    } catch { /* ignore */ }
-  }
-  return { ...DEFAULTS };
-}
-
-async function main(cfg: Config) {
-  console.log(`[${name}] Connected to ${cfg.baseUrl}`);
-  console.log(`[${name}] Timeout: ${cfg.timeout}ms | Retries: ${cfg.retries}`);
-  // TODO: implement your logic here
-  console.log(`[${name}] Done.`);
-}
-
-const program = new Command();
-program.name("agent-reputation-api").description("API for tracking and verifying agent reputation scores across networks").version("1.0.0")
-  .option("-c, --config <path>", "Config file path", "config.json")
-  .option("-v, --verbose", "Verbose mode")
-  .action(async (opts) => {
-    const cfg = loadConfig();
-    if (opts.verbose) console.log("Verbose mode on");
-    try { await main(cfg); }
-    catch (e) { console.error(`Error: ${e}`); process.exit(1); }
-  });
-program.parse(process.argv);
+export {
+  DIMENSIONS,
+  isDimension,
+  type Dimension,
+  type AgentRecord,
+  type Attestation,
+  type AttestationInput,
+  type ScoreReport,
+  type DimensionScore,
+  type ReputationTier,
+  type NetworkStats,
+  type LedgerEnvelope,
+} from "./types.js";
+export { ReputationError, isReputationError, ERROR_STATUS, type ErrorCode } from "./errors.js";
+export { systemClock, fixedClock, newId, type Clock } from "./clock.js";
+export {
+  canonicalAttestation,
+  signAttestation,
+  verifyAttestation,
+  constantTimeEqual,
+  newNonce,
+} from "./crypto.js";
+export { ReputationLedger, DEFAULTS, type LedgerOptions } from "./ledger.js";
+export {
+  computeScore,
+  computeAllComposites,
+  attestorWeight,
+  wilsonLowerBound,
+  HALF_LIFE_DAYS,
+  MAX_AGE_DAYS,
+} from "./scoring.js";
+export { saveEnvelope, loadEnvelope } from "./persistence.js";
+export { startServer, type ServerOptions } from "./server.js";
+export { formatScoreReport } from "./format.js";
+export { runDemo, DEMO_SECRET, DAY_MS } from "./demo.js";
+export { runCli } from "./cli.js";
